@@ -8,106 +8,99 @@
 # Code architecture, data pipelines, and filtering layers remain fully visible.
 # ==============================================================================
 
-import os
-import time
+import os, time
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
 # ==============================================================================
-# CONFIGURATION TARGET CORE MAKRO (PASAR INDONESIA - 7 SENSOR INSTITUSIONAL)
+# KONFIGURASI KHUSUS PASAR SAHAM INDONESIA (IDX)
 # ==============================================================================
-JUMLAH_SIMULASI = 10000
+JUMLAH_SIMULASI = 8000
 HARI_KE_DEPAN = 1
-THRESHOLD_PELUANG = 0.10       
-FILE_DAFTAR_EMITEN = "daftar_emiten_indo.txt" 
-FILE_OUTPUT_HASIL = "hasil_analisis_merton_indo.xlsx"  
+THRESHOLD_PANTAUAN = 0.10      # Pantau jika peluang <10%
+THRESHOLD_EKSEKUSI = 0.05      # Eksekusi jika peluang <5%
+FILE_DAFTAR_EMITEN = "daftar_emiten_idx.txt"
+FILE_OUTPUT_HASIL = "hasil_analisis_merton_idx.xlsx"  
 
-# AMBANG BATAS SENSOR BURSA EFEK INDONESIA (IDX)
-MINIMAL_NILAI_TRANSAKSI_IDR = 10000000000  
-BATAS_MAKSIMAL_PE = 35                     
-BATAS_MAKSIMAL_DER = 200                   
-MINIMAL_HARGA_NOMINAL = 100.0              
+# AMBANG BATAS PENYARINGAN KHUSUS IDX
+MINIMAL_NILAI_TRANSAKSI_IDR = 5000000000     # Minimal Rp 5 Miliar / hari
+BATAS_MAKSIMAL_PE = 35                       
+BATAS_MAKSIMAL_DER = 200                     
+MINIMAL_HARGA_NOMINAL = 50.0                 
+MINIMAL_ROE = 0.05                           
 # ==============================================================================
 
 print("=" * 135)
-print("📱 IDX MULTI-ASSET MERTON PIPELINE - PEMINDAIAN 7 LEVEL SENSOR FUNDAMENTAL & GROWTH REAL-TIME")
+print("🇮🇩 ANALISIS MERTON - KHUSUS PASAR SAHAM INDONESIA (IDX) | SATUAN RUPIAH")
 print("=" * 135)
 
 if not os.path.exists(FILE_DAFTAR_EMITEN):
-    print(f"❌ Error: File '{FILE_DAFTAR_EMITEN}' tidak ditemukan!")
+    print(f"❌ File '{FILE_DAFTAR_EMITEN}' tidak ditemukan!")
     exit()
 
 with open(FILE_DAFTAR_EMITEN, "r") as f:
     list_emiten = [line.strip().upper() for line in f if line.strip()]
 
 total_emiten = len(list_emiten)
-print(f"✅ Berhasil memuat {total_emiten} emiten dari data offline IDX.")
-print("Memulai pemindaian tingkat sensor mendalam harian...\n")
-
+print(f"✅ Memuat {total_emiten} kode saham.\n")
 semua_hasil = []
 
-# 2. PROSES PIPELINE LOOPING SAHAM INDONESIA
+# PROSES PEMINDAIAN
 for index, kode in enumerate(list_emiten, 1):
-    print(f"[{index}/{total_emiten}] Ticker: {kode} ... ", end="", flush=True)
+    print(f"[{index}/{total_emiten}] {kode} ... ", end="", flush=True)
     
     if not kode.endswith(".JK"):
-        print("❌ SKIP (Bukan .JK)")
-        continue
+        print("⚠️ Menambahkan akhiran .JK untuk IDX ... ", end="", flush=True)
+        kode = kode + ".JK"
     
     try:
         saham = yf.Ticker(kode)
         df_historis = saham.history(period="1y")
 
-        if len(df_historis) < 200:
-            print("❌ SKIP (Data < 200 hari)")
+        if len(df_historis) < 90:
+            print("❌ SKIP (Data < 90 hari)")
             continue
 
         harga_pasar_saat_ini = float(df_historis['Close'].iloc[-1])
-        volume_terakhir = int(df_historis['Volume'].iloc[-1])
 
-        # SENSOR A: LIKUIDITAS & TEKNIKAL
         if harga_pasar_saat_ini < MINIMAL_HARGA_NOMINAL:
-            print(f"❌ SKIP (Harga < Rp{MINIMAL_HARGA_NOMINAL:,.0f})")
+            print(f"❌ SKIP (Harga < Rp {MINIMAL_HARGA_NOMINAL:,.0f})")
             continue
 
-        df_historis['Nilai_Transaksi'] = df_historis['Volume'] * df_historis['Close']
-        rata_rata_likuiditas = df_historis['Nilai_Transaksi'].tail(20).mean()
-        rata_rata_miliar = rata_rata_likuiditas / 1e9 
+        # === PERHITUNGAN LIKUIDITAS (RUPIAH) ===
+        df_historis['Nilai_Transaksi_IDR'] = df_historis['Volume'] * df_historis['Close']
+        vol_terakhir_lembar = int(df_historis['Volume'].iloc[-1])
+        transaksi_terakhir_idr = float(df_historis['Nilai_Transaksi_IDR'].iloc[-1])
+        transaksi_terakhir_miliar = transaksi_terakhir_idr / 1e9
+        rata_rata_likuiditas = df_historis['Nilai_Transaksi_IDR'].tail(20).mean()
+        rata_rata_miliar_idr = rata_rata_likuiditas / 1e9 
         
         if rata_rata_likuiditas < MINIMAL_NILAI_TRANSAKSI_IDR:
-            print(f"❌ SKIP (Sepi, Rp{rata_rata_miliar:.1f} M/hari)")
+            print(f"❌ SKIP (Kurang cair, rata2 < Rp5 Miliar)")
             continue
 
-        ma_200 = df_historis['Close'].rolling(window=200).mean().iloc[-1]
-        if harga_pasar_saat_ini < ma_200:
-            print("❌ SKIP (Bearish, < MA 200)")
-            continue
-
-        # SENSOR B: FUNDAMENTAL RATIO & GROWTH EXTRACTION
+        # === FILTER FUNDAMENTAL KHUSUS IDX ===
         info_saham = saham.info
         roe = info_saham.get("returnOnEquity")
         pe_ratio = info_saham.get("trailingPE")
         debt_to_equity = info_saham.get("debtToEquity")
         eps_growth = info_saham.get("earningsGrowth")
 
-        if roe is None or roe <= 0:
-            print("❌ SKIP (ROE Negatif/Rugi)")
+        if roe is None or roe < MINIMAL_ROE:
+            print(f"❌ SKIP (ROE < {MINIMAL_ROE*100:.0f}%)")
             continue
-
         if pe_ratio is None or pe_ratio <= 0 or pe_ratio > BATAS_MAKSIMAL_PE:
-            print(f"❌ SKIP (P/E tidak ideal / > {BATAS_MAKSIMAL_PE})")
+            print(f"❌ SKIP (P/E > {BATAS_MAKSIMAL_PE})")
             continue
-
         if debt_to_equity is not None and debt_to_equity > BATAS_MAKSIMAL_DER:
-            print(f"❌ SKIP (Utang Tinggi, DER: {debt_to_equity:.1f}%)")
+            print(f"❌ SKIP (DER > {BATAS_MAKSIMAL_DER}%)")
             continue
-            
-        if eps_growth is not None and eps_growth <= 0:
-            print(f"❌ SKIP (Laba Mengalami Penurunan / EPS Growth: {eps_growth*100:.1f}%)")
+        if eps_growth is not None and eps_growth <= -0.10:
+            print("❌ SKIP (Laba turun >10%)")
             continue
 
-        # PROSES INTI QUANTITATIVE MODELING
+        # === MODEL MERTON (DISESUAIKAN VOLATILITAS) ===
         df = df_historis.tail(90).copy().sort_index()
         df['Log_Return'] = np.log(df['Close'] / df["Close"].shift(1))
         log_returns = df['Log_Return'].dropna()
@@ -117,27 +110,35 @@ for index, kode in enumerate(list_emiten, 1):
         batas_shock_historis = volatilitas_total * harga_pasar_saat_ini
         
         hasil_dua_zona = {}
+        target_uji_list = [
+            ("SUPPORT_SHOCK", harga_pasar_saat_ini - batas_shock_historis), 
+            ("RESISTANCE_SHOCK", harga_pasar_saat_ini + batas_shock_historis)
+        ]
 
-        for jenis_uji, harga_uji in [("SUPPORT_SHOCK", harga_pasar_saat_ini - batas_shock_historis), 
-                                     ("RESISTANCE_SHOCK", harga_pasar_saat_ini + batas_shock_historis)]:
-
+        for jenis_uji, harga_uji in target_uji_list:
             status_posisi = "BAWAH" if harga_uji < harga_pasar_saat_ini else "ATAS"
+            batas_jump = 1.8 * volatilitas_total  # Lebih lebar untuk pasar IDX
+            jumps = log_returns[abs(log_returns) > batas_jump]
+            
+            lambda_jump = len(jumps) / len(log_returns) if len(log_returns) > 0 else 0.06
+            mu_jump = jumps.mean() if len(jumps) > 0 else 0.0
+            sigma_jump = jumps.std(ddof=1) if len(jumps) > 1 else 0.015
+            volatilitas_dasar = np.sqrt(max(0.0001, volatilitas_total**2 - lambda_jump * (mu_jump**2 + sigma_jump**2)))
 
-            # ------------------------------------------------------------------
-            # PROPRIETARY PROTECTION ZONING (RUMUS INTI DI-MASKING)
-            # ------------------------------------------------------------------
-            # Catatan Portofolio: Bagian ini menggunakan simulasi stokastik standar
-            # untuk mendemonstrasikan kapabilitas structural coding Python tanpa
-            # membocorkan koefisien Alpha & parameter Jump Diffusion komersial.
-            
             W = np.random.normal(0, 1, JUMLAH_SIMULASI)
-            komp_drift = drift_aktual * HARI_KE_DEPAN
-            komp_difusi = volatilitas_total * np.sqrt(HARI_KE_DEPAN) * W
-            efek_jump = np.random.normal(0, 0.01, JUMLAH_SIMULASI) # Placeholder noise
+            N = np.random.poisson(lambda_jump * HARI_KE_DEPAN, JUMLAH_SIMULASI)
+            max_jumps = int(np.max(N))
+            efek_jump = np.zeros(JUMLAH_SIMULASI)
+            if max_jumps > 0:
+                for j in range(1, max_jumps + 1):
+                    mask = (N >= j)
+                    efek_jump[mask] += np.random.normal(mu_jump, sigma_jump, np.sum(mask))
             
+            k = np.exp(mu_jump + 0.5 * sigma_jump**2) - 1
+            komp_drift = (drift_aktual - lambda_jump * k) * HARI_KE_DEPAN
+            komp_difusi = volatilitas_dasar * np.sqrt(HARI_KE_DEPAN) * W
             prediksi_harga_pasar = harga_pasar_saat_ini * np.exp(komp_drift + komp_difusi + efek_jump)
             jarak_deviasi = abs(harga_pasar_saat_ini - harga_uji)
-            # ------------------------------------------------------------------
 
             if status_posisi == "BAWAH":
                 target_atas_cermin = harga_pasar_saat_ini + jarak_deviasi
@@ -148,48 +149,71 @@ for index, kode in enumerate(list_emiten, 1):
                 peluang_naik = np.mean(prediksi_harga_pasar > harga_uji)
                 peluang_turun = np.mean(prediksi_harga_pasar < target_bawah_cermin)
 
+            # REKOMENDASI
             rekomendasi = "WAIT (Belum Jenuh)"
-            if status_posisi == "BAWAH" and peluang_turun < THRESHOLD_PELUANG:
-                rekomendasi = "🔥 BIDIK BUY! (Jenuh Jual)"
-            elif status_posisi == "ATAS" and peluang_naik < THRESHOLD_PELUANG:
-                rekomendasi = "⚠️ HATI-HATI SELL! (Jenuh Beli)"
+            if status_posisi == "BAWAH":
+                if peluang_turun < THRESHOLD_EKSEKUSI:
+                    rekomendasi = "🔥 BIDIK BUY! (Jenuh Jual <5%)"
+                elif peluang_turun < THRESHOLD_PANTAUAN:
+                    rekomendasi = "WAIT (Peluang Beli <10%)"
+            else:
+                if peluang_naik < THRESHOLD_EKSEKUSI:
+                    rekomendasi = "⚠️ HATI-HATI SELL! (Jenuh Beli <5%)"
+                elif peluang_naik < THRESHOLD_PANTAUAN:
+                    rekomendasi = "WAIT (Peluang Jual <10%)"
 
             hasil_dua_zona[jenis_uji] = {
-                "Ticker": kode,
-                "Harga_Live": harga_pasar_saat_ini,
-                "Transaksi_Avg_Miliar": round(rata_rata_miliar, 2),
-                "ROE_Pct": round(roe * 100, 2) if roe is not None else "N/A",
-                "P/E_Ratio": round(pe_ratio, 2) if pe_ratio is not None else "N/A",
-                "DER_Pct": round(debt_to_equity, 2) if debt_to_equity is not None else "N/A",
-                "EPS_Growth%": round(eps_growth * 100, 2) if eps_growth is not None else "N/A",
+                "Ticker": kode.replace(".JK", ""),
+                "Harga_Terkini (Rp)": round(harga_pasar_saat_ini, 2),
+                "Volume_Terakhir (Lembar)": vol_terakhir_lembar,
+                "Transaksi_Terakhir (Miliar Rp)": round(transaksi_terakhir_miliar, 2),
+                "Transaksi_Rata20 (Miliar Rp)": round(rata_rata_miliar_idr, 2),
+                "ROE (%)": round(roe * 100, 2) if roe is not None else "N/A",
+                "P/E_Rasio": round(pe_ratio, 2) if pe_ratio is not None else "N/A",
+                "DER (%)": round(debt_to_equity, 2) if debt_to_equity is not None else "N/A",
+                "Pertumbuhan_Laba (%)": round(eps_growth * 100, 2) if eps_growth is not None else "N/A",
                 "Tipe_Zona": jenis_uji,
-                "Harga_Uji": round(harga_uji, 2),
-                "P_Naik%": round(peluang_naik * 100, 1),
-                "P_Turun%": round(peluang_turun * 100, 1),
+                "Harga_Batas_Uji (Rp)": round(harga_uji, 2),
+                "Peluang_Naik (%)": round(peluang_naik * 100, 1),
+                "Peluang_Turun (%)": round(peluang_turun * 100, 1),
                 "Sinyal_Akhir": rekomendasi
             }
 
+        # CEK KONSOLIDASI
         s_bawah = hasil_dua_zona["SUPPORT_SHOCK"]["Sinyal_Akhir"]
         s_atas = hasil_dua_zona["RESISTANCE_SHOCK"]["Sinyal_Akhir"]
+        p_naik_val = hasil_dua_zona["RESISTANCE_SHOCK"]["Peluang_Naik (%)"]
+        p_turun_val = hasil_dua_zona["SUPPORT_SHOCK"]["Peluang_Turun (%)"]
+        selisih_peluang = abs(p_naik_val - p_turun_val)
 
-        if "BUY" in s_bawah and "SELL" in s_atas:
-            hasil_dua_zona["SUPPORT_SHOCK"]["Sinyal_Akhir"] = "🔄 KONSOLIDASI KETAT"
-            hasil_dua_zona["RESISTANCE_SHOCK"]["Sinyal_Akhir"] = "🔄 KONSOLIDASI KETAT"
+        if ("BUY" in s_bawah or "Beli" in s_bawah) and ("SELL" in s_atas or "Jual" in s_atas):
+            if selisih_peluang < 2.0:
+                hasil_dua_zona["SUPPORT_SHOCK"]["Sinyal_Akhir"] = "🔄 KONSOLIDASI KETAT"
+                hasil_dua_zona["RESISTANCE_SHOCK"]["Sinyal_Akhir"] = "🔄 KONSOLIDASI KETAT"
 
         semua_hasil.append(hasil_dua_zona["SUPPORT_SHOCK"])
         semua_hasil.append(hasil_dua_zona["RESISTANCE_SHOCK"])
             
-        print(f"✅ OK (Avg: {rata_rata_miliar:.1f} M/hari)")
-        
-    except Exception as e:
-        print(f"❌ ERROR: {str(e)}")
+        print(f"✅ OK | Rata2: Rp {rata_rata_miliar_idr:.1f} Miliar")
+        time.sleep(0.6)
 
-# 3. EXPORT KE EXCEL DATA FRAME HASIL PEMINDAIAN MODEL
+    except Exception as e:
+        print(f"❌ ERROR: {str(e)[:50]}...")
+        continue
+
+# === SIMPAN HASIL ===
 print("\n" + "=" * 135)
 if semua_hasil:
     df_final = pd.DataFrame(semua_hasil)
+    urutan_kolom = [
+        "Ticker", "Harga_Terkini (Rp)", "Volume_Terakhir (Lembar)",
+        "Transaksi_Terakhir (Miliar Rp)", "Transaksi_Rata20 (Miliar Rp)",
+        "ROE (%)", "P/E_Rasio", "DER (%)", "Pertumbuhan_Laba (%)",
+        "Tipe_Zona", "Harga_Batas_Uji (Rp)", "Peluang_Naik (%)", "Peluang_Turun (%)", "Sinyal_Akhir"
+    ]
+    df_final = df_final[urutan_kolom]
     df_final.to_excel(FILE_OUTPUT_HASIL, index=False)
-    print(f"📊 Pemindaian selesai! Berhasil mengekspor {len(df_final)} baris analisis ke '{FILE_OUTPUT_HASIL}'.")
+    print(f"🎉 BERHASIL! Hasil tersimpan di: '{FILE_OUTPUT_HASIL}'")
 else:
-    print("⚠️ Tidak ada emiten yang lolos sensor pemindaian hari ini.")
+    print("❌ Tidak ada saham IDX yang lolos syarat.")
 print("=" * 135)
